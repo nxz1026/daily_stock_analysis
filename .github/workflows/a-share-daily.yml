@@ -1,0 +1,55 @@
+name: A股每日分析
+
+on:
+  schedule:
+    - cron: '0 10 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: a-share-analysis
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_BASE_URL: https://api.longcat.chat/openai
+      OPENAI_MODEL: LongCat-2.0-Preview
+      STOCK_LIST: 600917
+      REPORT_TYPE: simple
+      REPORT_LANGUAGE: zh
+      MARKET_REVIEW_ENABLED: 'true'
+      DAILY_MARKET_CONTEXT_ENABLED: 'true'
+      MARKET_REVIEW_REGION: cn
+      EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      SCHEDULE_RUN_IMMEDIATELY: 'false'
+      AGENT_MODE: 'false'
+      MAX_WORKERS: 1
+      SCHEDULE_ENABLED: 'false'
+      LOG_LEVEL: INFO
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt && mkdir -p data logs reports
+
+      - name: 运行分析
+        run: python main.py --force-run --stocks 600917
+
+      - name: 上传报告
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reports-${{ github.run_number }}
+          path: reports/
+          retention-days: 7
