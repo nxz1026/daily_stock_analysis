@@ -26,6 +26,7 @@ jobs:
       MARKET_REVIEW_REGION: cn
       EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
       EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
       SCHEDULE_RUN_IMMEDIATELY: 'false'
       AGENT_MODE: 'false'
       MAX_WORKERS: 1
