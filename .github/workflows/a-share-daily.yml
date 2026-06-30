@@ -17,7 +17,7 @@ jobs:
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_BASE_URL: https://api.longcat.chat/openai
-      OPENAI_MODEL: LongCat-2.0-Preview
+      OPENAI_MODEL: LongCat-2.0
       STOCK_LIST: 600917
       REPORT_TYPE: simple
       REPORT_LANGUAGE: zh

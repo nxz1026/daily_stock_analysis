@@ -37,6 +37,10 @@ jobs:
     # 添加超时限制，防止任务卡死
     timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
     
+    env:
+      OPENAI_BASE_URL: https://api.longcat.chat/openai
+      OPENAI_MODEL: LongCat-2.0
+    
     steps:
       - name: 随机延迟（避免固定时间访问）
         run: sleep $((RANDOM % 60))  # 随机延迟0-60秒启动
