@@ -9,6 +9,7 @@ import { formatDateTime } from '../../utils/format';
 import { getMarketPhaseSummaryLabel, getPartialBarLabel } from '../../utils/marketPhase';
 import { getReportText, normalizeReportLanguage } from '../../utils/reportLanguage';
 import { useUiLanguage } from '../../contexts/UiLanguageContext';
+import { ShareImageButton } from './ShareImageButton';
 
 interface ReportOverviewProps {
   meta: ReportMeta;
@@ -80,23 +81,25 @@ const buildRankingSignalMap = (rankings?: ReportDetailsType['sectorRankings']): 
 
   topBoards.forEach((item) => {
     const normalizedName = normalizeBoardName(item?.name);
-    if (!normalizedName) {
+    const changePct = coerceFiniteNumber(item?.changePct);
+    if (!normalizedName || changePct === undefined) {
       return;
     }
     signalMap.set(normalizedName, {
       status: 'leading',
-      changePct: coerceFiniteNumber(item.changePct),
+      changePct,
     });
   });
 
   bottomBoards.forEach((item) => {
     const normalizedName = normalizeBoardName(item?.name);
-    if (!normalizedName) {
+    const changePct = coerceFiniteNumber(item?.changePct);
+    if (!normalizedName || changePct === undefined) {
       return;
     }
     signalMap.set(normalizedName, {
       status: 'lagging',
-      changePct: coerceFiniteNumber(item.changePct),
+      changePct,
     });
   });
 
@@ -248,8 +251,8 @@ export const ReportOverview: React.FC<ReportOverviewProps> = ({
         <div className="lg:col-span-2 space-y-5">
           {/* 股票头部 */}
           <Card variant="gradient" padding="md" className="home-report-hero">
-            <div className="flex items-start justify-between mb-5">
-              <div className="flex-1">
+            <div className="mb-5 flex items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-3">
                   <h2 className="text-[28px] font-bold leading-tight text-foreground">
                     {meta.stockName || meta.stockCode}
@@ -288,6 +291,11 @@ export const ReportOverview: React.FC<ReportOverviewProps> = ({
                   </span>
                 </div>
               </div>
+              <ShareImageButton
+                recordId={meta.id}
+                reportTitle={`${meta.stockName || meta.stockCode}-${meta.stockCode}`}
+                reportLanguage={reportLanguage}
+              />
             </div>
 
             {/* 关键结论 */}

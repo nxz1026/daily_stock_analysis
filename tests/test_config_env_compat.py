@@ -7,12 +7,63 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.config import Config, DEFAULT_ALPHASIFT_INSTALL_SPEC, setup_env
+from src.config import Config, setup_env
 
 
 class ConfigEnvCompatibilityTestCase(unittest.TestCase):
     def tearDown(self):
         Config.reset_instance()
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    @patch.object(Config, "_parse_stock_email_groups", return_value=[])
+    def test_share_image_social_branding_is_optional_and_configurable(
+        self, _mock_parse_stock_email_groups, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "SHARE_IMAGE_XIAOHONGSHU_URL": "https://example.com/xhs",
+                "SHARE_IMAGE_XIAOHONGSHU_HANDLE": "@自定义账号",
+                "SHARE_IMAGE_XIAOHONGSHU_ID": "123456",
+                "SHARE_IMAGE_XIAOHONGSHU_QR_PATH": "assets/custom-xhs.png",
+            },
+            clear=True,
+        ):
+            configured = Config._load_from_env()
+
+        self.assertEqual(configured.share_image_xiaohongshu_url, "https://example.com/xhs")
+        self.assertEqual(configured.share_image_xiaohongshu_handle, "@自定义账号")
+        self.assertEqual(configured.share_image_xiaohongshu_id, "123456")
+        self.assertEqual(configured.share_image_xiaohongshu_qr_path, "assets/custom-xhs.png")
+
+        with patch.dict(os.environ, {}, clear=True):
+            disabled = Config._load_from_env()
+
+        self.assertIsNone(disabled.share_image_xiaohongshu_url)
+        self.assertIsNone(disabled.share_image_xiaohongshu_handle)
+        self.assertIsNone(disabled.share_image_xiaohongshu_id)
+        self.assertIsNone(disabled.share_image_xiaohongshu_qr_path)
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    @patch.object(Config, "_parse_stock_email_groups", return_value=[])
+    def test_stock_list_accepts_common_copy_paste_separators(
+        self, _mock_parse_stock_email_groups, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519，300750  hk00700;AAPL、7203.T\n005930.KS",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(
+            config.stock_list,
+            ["600519", "300750", "HK00700", "AAPL", "7203.T", "005930.KS"],
+        )
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
@@ -65,6 +116,10 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
         self.assertEqual(config.market_review_region, "cn,us,kr")
 
+    def test_market_review_region_keeps_legacy_mixed_both_and_empty_token_compatibility(self) -> None:
+        self.assertEqual(Config._parse_market_review_region("both,us"), "cn,hk,us,jp,kr")
+        self.assertEqual(Config._parse_market_review_region("cn,,us"), "cn,us")
+
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_market_review_region_falls_back_to_cn_when_no_supported_tokens(
@@ -112,7 +167,25 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
         self.assertEqual(config.generation_backend, "litellm")
         self.assertEqual(config.generation_fallback_backend, "litellm")
+        self.assertEqual(config.agent_backend, "auto")
         self.assertEqual(config.agent_generation_backend, "auto")
+
+    @patch("src.config.setup_env")
+    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
+    def test_agent_backend_env_accepts_codex_app_server(
+        self, _mock_parse_litellm_yaml, _mock_setup_env
+    ):
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_LIST": "600519",
+                "AGENT_BACKEND": " CODEX_APP_SERVER ",
+            },
+            clear=True,
+        ):
+            config = Config._load_from_env()
+
+        self.assertEqual(config.agent_backend, "codex_app_server")
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
@@ -231,7 +304,7 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             config = Config._load_from_env()
 
         self.assertEqual(config.fundamental_stage_timeout_seconds, 8.0)
-        self.assertEqual(config.fundamental_fetch_timeout_seconds, 3.0)
+        self.assertEqual(config.fundamental_fetch_timeout_seconds, 8.0)
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
@@ -267,16 +340,6 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
-    def test_alphasift_install_spec_defaults_only_when_env_missing(
-        self, _mock_parse_litellm_yaml, _mock_setup_env
-    ):
-        with patch.dict(os.environ, {"STOCK_LIST": "600519"}, clear=True):
-            config = Config._load_from_env()
-
-        self.assertEqual(config.alphasift_install_spec, DEFAULT_ALPHASIFT_INSTALL_SPEC)
-
-    @patch("src.config.setup_env")
-    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
     def test_news_intel_envs_do_not_change_llm_runtime_contract(
         self,
         _mock_parse_litellm_yaml,
@@ -298,6 +361,7 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
             "NEWS_INTEL_RETENTION_DAYS": "45",
             "NEWS_INTEL_FETCH_TIMEOUT_SEC": "5.5",
             "NEWS_INTEL_MAX_ITEMS_PER_SOURCE": "25",
+            "NEWS_INTEL_AUTO_FETCH_ENABLED": "true",
             "NEWSNOW_BASE_URL": "https://newsnow.example.com/",
         })
         with patch.dict(os.environ, news_intel_env, clear=True):
@@ -311,6 +375,7 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(with_news_intel.news_intel_fetch_timeout_sec, 5.5)
         self.assertEqual(with_news_intel.news_intel_max_items_per_source, 25)
         self.assertEqual(with_news_intel.news_intel_retention_days, 45)
+        self.assertTrue(with_news_intel.news_intel_auto_fetch_enabled)
         self.assertEqual(with_news_intel.newsnow_base_url, "https://newsnow.example.com")
 
     @patch("src.config.setup_env")
@@ -344,33 +409,6 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(with_jpkr.openai_model, baseline.openai_model)
         self.assertEqual(with_jpkr.openai_api_key, baseline.openai_api_key)
         self.assertEqual(with_jpkr.openai_base_url, baseline.openai_base_url)
-
-    def test_env_example_alphasift_install_spec_matches_trusted_default(self):
-        env_example = Path(__file__).resolve().parents[1] / ".env.example"
-
-        for line in env_example.read_text(encoding="utf-8").splitlines():
-            if line.startswith("ALPHASIFT_INSTALL_SPEC="):
-                self.assertEqual(
-                    line,
-                    f"ALPHASIFT_INSTALL_SPEC={DEFAULT_ALPHASIFT_INSTALL_SPEC}",
-                )
-                break
-        else:
-            self.fail("ALPHASIFT_INSTALL_SPEC missing from .env.example")
-
-    @patch("src.config.setup_env")
-    @patch.object(Config, "_parse_litellm_yaml", return_value=[])
-    def test_alphasift_install_spec_honors_explicit_empty(
-        self, _mock_parse_litellm_yaml, _mock_setup_env
-    ):
-        with patch.dict(
-            os.environ,
-            {"STOCK_LIST": "600519", "ALPHASIFT_INSTALL_SPEC": ""},
-            clear=True,
-        ):
-            config = Config._load_from_env()
-
-        self.assertEqual(config.alphasift_install_spec, "")
 
     @patch("src.config.setup_env")
     @patch.object(Config, "_parse_litellm_yaml", return_value=[])
@@ -521,6 +559,7 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
                 "NEWS_INTEL_RETENTION_DAYS": "14",
                 "NEWS_INTEL_FETCH_TIMEOUT_SEC": "12",
                 "NEWS_INTEL_MAX_ITEMS_PER_SOURCE": "75",
+                "NEWS_INTEL_AUTO_FETCH_ENABLED": "yes",
                 "NEWSNOW_BASE_URL": "https://newsnow.example.com/base/",
             },
             clear=True,
@@ -533,6 +572,7 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertEqual(config.news_intel_retention_days, 14)
         self.assertEqual(config.news_intel_fetch_timeout_sec, 12.0)
         self.assertEqual(config.news_intel_max_items_per_source, 75)
+        self.assertTrue(config.news_intel_auto_fetch_enabled)
         self.assertEqual(config.newsnow_base_url, "https://newsnow.example.com/base")
 
     @patch("src.config.setup_env")
@@ -863,6 +903,22 @@ class ConfigEnvCompatibilityTestCase(unittest.TestCase):
         self.assertTrue(
             any(issue.severity == "error" and issue.field == "STOCK_LIST" for issue in issues)
         )
+
+    def test_refresh_stock_list_accepts_runtime_env_common_separators(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing_env_path = Path(temp_dir) / "missing.env"
+            config = Config(stock_list=["600519"])
+            with patch.dict(
+                os.environ,
+                {
+                    "ENV_FILE": str(missing_env_path),
+                    "STOCK_LIST": "600519，300750 AAPL",
+                },
+                clear=True,
+            ):
+                config.refresh_stock_list()
+
+        self.assertEqual(config.stock_list, ["600519", "300750", "AAPL"])
 
     def test_parse_report_language_accepts_known_alias_without_warning(self) -> None:
         with self.assertNoLogs("src.config", level="WARNING"):

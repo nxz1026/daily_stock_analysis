@@ -20,9 +20,32 @@
 
 优先级保持不变：`LITELLM_CONFIG` / `LITELLM_CONFIG_YAML` > `LLM_CHANNELS` > legacy provider keys。P4 只补文档，不迁移、不清空、不静默改写旧配置。
 
-Generation backend 配置是更外层的运行时选择契约。Phase 2 支持 `GENERATION_BACKEND=litellm|codex_cli`，但 `codex_cli` 是本地 CLI backend，不是 LiteLLM provider；不要配置成 `LITELLM_MODEL=codex_cli/...`。`codex_cli` preset 使用 `codex exec --output-last-message <temp-file> -` 读取最终响应；Codex CLI 仍会把同一最终响应打印到 stdout，DSA 会从 stdout 诊断预览和输出大小统计中剔除这份重复内容。诊断 stdout/stderr 与最终响应一起受 `GENERATION_BACKEND_MAX_OUTPUT_BYTES` 总上限约束，超限时返回结构化 `output_too_large`。官方依据见 [Codex non-interactive mode](https://developers.openai.com/codex/noninteractive) 与 [Codex CLI command line options](https://developers.openai.com/codex/cli/reference)；本仓库当前只验证 `codex-cli 0.142.0`，不声明更宽最低版本。`GENERATION_FALLBACK_BACKEND=` 空值会在本地 `.env` 禁用 backend-level fallback，未配置时默认回退到 `litellm`；默认 GitHub Actions workflow 未配置该变量时会显式使用 `litellm`，如需禁用 fallback 可设为 primary backend 走 self no-op。Agent 工具调用仍使用 LiteLLM；Web 设置页只暴露 `AGENT_GENERATION_BACKEND=auto|litellm`，手写 `codex_cli` 不会启用 text-only Agent mode，只会返回明确 unsupported tool-calling 诊断。
+Generation backend 配置是更外层的运行时选择契约。Phase 4 支持 `GENERATION_BACKEND=litellm|codex_cli|claude_code_cli|opencode_cli`，但本地 CLI backend 不是 LiteLLM provider；不要配置成 `LITELLM_MODEL=codex_cli/...`、`LITELLM_MODEL=claude_code_cli/...` 或 `LITELLM_MODEL=opencode_cli/...`。`codex_cli` preset 使用 `codex --ask-for-approval never exec --sandbox read-only --output-last-message <temp-file> -`，固定无人值守批准策略并保持只读边界；`claude_code_cli` preset 使用 `claude --safe-mode --tools "" --disallowedTools "mcp__*" --strict-mcp-config --no-session-persistence --output-format json -p <static instruction>`，完整 DSA prompt 走 stdin，并只从 JSON envelope 的 `result/success` 字段提取最终文本，参数依据见 [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference)；`opencode_cli` preset 使用 `opencode --pure run --format json [--model <OPENCODE_CLI_MODEL>] <static instruction> --file <temp prompt file>`，仅在显式配置 `OPENCODE_CLI_MODEL` 时追加 `--model`，完整 DSA prompt 走权限受控的临时文件，并只从无工具事件的 JSON event text 输出提取最终文本，参数依据见 [OpenCode CLI reference](https://opencode.ai/docs/cli)，配置合并语义见 [OpenCode config reference](https://opencode.ai/docs/config)。诊断 stdout/stderr 与最终响应一起受 `GENERATION_BACKEND_MAX_OUTPUT_BYTES` 总上限约束，超限时返回结构化 `output_too_large`。`GENERATION_FALLBACK_BACKEND=` 空值会在本地 `.env` 禁用 backend-level fallback，未配置时默认回退到 `litellm`；默认 GitHub Actions workflow 未配置该变量时会显式使用 `litellm`，如需禁用 fallback 可设为 primary backend 走 self no-op。Agent 工具调用仍使用 LiteLLM；Web 设置页只暴露 `AGENT_GENERATION_BACKEND=auto|litellm`，手写 `codex_cli|claude_code_cli|opencode_cli` 不会启用 text-only Agent mode，只会返回明确 unsupported tool-calling 诊断。
 
-本地 CLI Backend 不等于离线模型。Docker、云服务器和 CI 不天然拥有本机 CLI 登录态；DSA 不读取 Codex credential 文件，但子进程可能使用 CLI 自身登录态，股票代码、新闻、持仓上下文、分析 prompt 和报告草稿可能被对应 CLI 背后的服务处理。
+生成后端状态接口与 Web 面板会把轻量检查和冒烟测试分开展示：快速检查只读取已保存 `.env`、运行时兜底值和当前草稿，不写配置、不重载运行时，也不发起真实模型请求；只有 JSON 冒烟测试会使用固定的 JSON 提示词和 schema 发起真实请求。`health_status` 与 `last_error_code/message` 是本次计算结果，不表示历史最后错误。本地 CLI preset 的 `supports_tools=false` 仅表示不支持 DSA Agent 工具调用链路，不代表普通文本生成不可用。
+
+Phase 6a Tool Surface 是 AgentBackend 的唯一内部工具面：统一 DSA 工具 schema、public descriptor、MCP-compatible descriptor、scope guard、结构化错误、审计摘要和脱敏诊断。stock-scoped 工具调用必须显式传入 `ToolAccessContext.stock_scope`；有 `stock_code` 参数但未声明 stock scope 的工具会 fail-closed。Phase 6 的 Codex App Server adapter 只通过该 Tool Surface 执行工具；它不把 `codex_cli` generation backend、MCP server、SDK 或最终文本 fallback 当成 Agent 工具成功。
+
+## Codex App Server 问股边界
+
+`AGENT_BACKEND=codex_app_server` 是现有问股 Chat 的实验运行方式，不是新的 provider 模型渠道，也不改变 `GENERATION_BACKEND`。Web 中在「设置 → Agent 设置 → 问股生成方式」选择后，必须使用 `AGENT_ARCH=single` 和大于 0 的整体时限。设置页只检查配置、Codex 命令和所需 App Server 协议是否允许尝试；保存后用户可直接提问，第一次问题就是第一次真实执行。`auto`（推荐）和 `litellm` 始终保持原有 LiteLLM 问股路径。
+
+- DSA 使用 [Codex App Server v2](https://developers.openai.com/codex/app-server/) 的 JSONL stdio、ephemeral thread 和 experimental dynamic tools，并通过 `turn/interrupt` 处理 Chat 取消。2026-07-15 的验收版本为 `codex-cli 0.144.3`，不据此硬编码最低版本。
+- Codex 必须安装并登录在运行 DSA 后端的设备；DSA 不读取或保存 Codex 凭据。Docker、远程服务器与 Desktop 的 PATH 和登录态相互独立。
+- Phase 6 Codex App Server Agent 当前支持 macOS、Linux 和完整运行于 WSL 的 DSA 后端，暂不支持原生 Windows；这不影响 Phase 2 `codex_cli` GenerationBackend 的 Windows 支持。
+- Codex 当前只开放已保存分析上下文、全局回测汇总和策略回测汇总的只读查询；本期只验证这三个工具的独立进程、停止、超时和回收闭环。实时行情、新闻、市场热点、技术指标重算、个股回测明细和持仓工具未纳入本期验证，因此不会暴露给 Codex；需要这些能力时应选择「默认模型」。明确股票代码或 Web 唯一匹配的股票只为已开放的历史分析上下文工具建立股票范围，跨市场同名等歧义不会猜测。
+- 问股历史的 LLM 压缩仅用于「默认模型」。Codex 始终使用最近 20 条用户可见对话，不会调用 `AGENT_LITELLM_MODEL` 生成摘要；用户已保存的压缩配置会保留，切回默认模型后继续生效。
+- 当前只支持 single-agent Chat，不支持 Codex Multi Agent / Codex Deep Research；现有 LiteLLM Multi Agent 和 Deep Research 不受影响。
+- cheap status 不发模型请求，只检查生产路径依赖的 App Server schema 能力且不绑定武断最低版本。仓库中的 `scripts/codex_app_server_gate_a.py` 仅用于维护者可行性验收，不是设置页按钮或生产 API；普通用户的第一个真实问题就是首次真实执行。
+- 用户停止 Codex 问股时，Web 会先显示“正在停止”；后端中断 Codex turn，并终止、回收本轮独立运行的工具进程。只有 Codex 与工具进程都已退出，原 SSE 请求才返回最终“已停止”。超时和客户端断开遵守相同的清理边界，不会把仍在后台运行的任务当成已经结束。默认 LiteLLM Agent 行为保持不变。
+- 基础状态只表达本机“可以尝试”，不检查登录、模型或真实工具闭环，也不缓存成功证据。正式 Chat 由服务端选择实际 backend；上下文准备和用户消息保存完成后发出唯一 `accepted` 事件，再启动模型。Web 在 `accepted` 前保留输入、股票范围、追问上下文和技能选择，并以 `accepted.backend` 决定停止方式。Codex 的累计输出、事件和工具调用均受整轮预算约束，工具调用数沿用 `AGENT_MAX_STEPS`。
+- Codex 不是离线模型；股票代码、新闻、持仓上下文及脱敏工具结果可能由 Codex 自身配置的服务处理。
+
+本 PR smoke 验证版本为 `claude 2.1.177 (Claude Code)` 与 `opencode 1.17.11`，不声明更宽最低版本。如果用户安装的 CLI 不支持这些固定 preset 参数或非交互输出契约，DSA 会返回结构化 `capability_unsupported`、`cli_contract_unsupported`、`invalid_json`、`schema_validation_failed` 或对应 backend error，并在配置 backend fallback 时回退到 `litellm`。
+
+本地 CLI Backend 不等于离线模型。Docker、云服务器和 CI 不天然拥有本机 CLI 登录态；macOS 从 Finder/Dock 启动桌面端时不继承 shell PATH，打包桌面端会在启动后端时补入常见 Homebrew 路径，如果设置检查仍提示找不到 CLI 可执行文件，需要完全退出并重开 DSA。DSA 不读取 Codex/Claude/OpenCode credential 文件，也不为 OpenCode 生成或搬运 provider API key；子进程可能按 CLI 自身机制使用本机登录态或配置，股票代码、新闻、持仓上下文、分析 prompt 和报告草稿可能被对应 CLI 背后的服务处理。DSA 默认只继承最小运行环境，并拒绝通配继承 `CLAUDE_*`、`ANTHROPIC_*`、`OPENCODE_*`、provider API key/token/base-url/model env 和 webhook tokens，降低父进程配置泄漏风险；`CODEX_HOME` 仅作为既有 Codex CLI 登录目录兼容的 exact-name 例外保留。
+
+`opencode_cli` 是 experimental/limited generation backend，不支持 OpenCode serve / web / ACP / MCP / attach / `--dangerously-skip-permissions`。DSA 默认使用本机 OpenCode 的默认模型；`OPENCODE_CLI_MODEL` 只是可选模型覆盖值，配置时才传给 OpenCode `--model`。DSA 会在临时 cwd 写入最小项目 `opencode.json`，但 OpenCode resolved config 仍可能包含用户本机全局配置；运行时安全边界同时依赖 `--pure`、env denylist、prompt file 权限和 event extractor fail-closed。
 
 ## Web 设置页路径
 
@@ -53,6 +76,7 @@ LITELLM_MODEL=deepseek/deepseek-v4-flash
 ```env
 LLM_CHANNELS=my_proxy
 LLM_MY_PROXY_PROTOCOL=openai
+LLM_MY_PROXY_API_SURFACE=chat_completions
 LLM_MY_PROXY_BASE_URL=https://your-proxy.example.com/v1
 LLM_MY_PROXY_API_KEY=sk-xxx
 LLM_MY_PROXY_MODELS=gpt-5.5,claude-sonnet-4-6
@@ -60,6 +84,23 @@ LLM_MY_PROXY_MODELS=gpt-5.5,claude-sonnet-4-6
 
 OpenAI-compatible Base URL 只填到服务商兼容入口，不额外拼接 `/chat/completions`。本地 `.env`、Docker 和自托管脚本可以直接使用自定义 channel；GitHub Actions 需要 workflow 显式透传同名 `LLM_MY_PROXY_*` 变量。
 小米 MiMo 示例同理：适用于本地 `.env`、Docker 或自托管脚本；若在 GitHub Actions 使用 `LLM_CHANNELS=mimo`，需要在 workflow 中手动补齐 `LLM_MIMO_*` 映射后方可生效。
+
+### Anspire Responses API（GPT-5.6 名称为观测样本）
+
+Anspire 官方接入页公开了 `https://open-gateway.anspire.cn/v6/responses` 调用方式：<https://open.anspire.cn/model?link=sample&tab=models>。如果实时 `/models`、服务商说明和连接测试确认目标模型使用 Responses，可把模型放在同一渠道，并显式把 API Surface 设为 `responses`。下面的 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna` 是当前网关观测样本，不作为长期模型清单承诺：
+
+```env
+LLM_CHANNELS=anspire
+LLM_ANSPIRE_PROTOCOL=openai
+LLM_ANSPIRE_API_SURFACE=responses
+LLM_ANSPIRE_BASE_URL=https://open-gateway.anspire.cn/v6
+LLM_ANSPIRE_API_KEY=sk-xxx
+LLM_ANSPIRE_MODELS=gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna
+LITELLM_MODEL=openai/gpt-5.6-sol
+LITELLM_FALLBACK_MODELS=openai/gpt-5.6-terra,openai/gpt-5.6-luna
+```
+
+这里的能力不依赖 `gpt-5.6-*` 命名：任何服务商明确声明为 Responses-only 的模型都可使用同一配置方式。模型清单和账号权限可能变化，应以服务商 `/models` 返回、官方说明及实际连接测试为准。一个渠道只能使用一种 API Surface；若还要同时使用 Anspire 的 Chat Completions 模型，请为它们建立另一个 OpenAI-compatible 渠道，不要把两类模型混在同一渠道中。Web 设置页的「测试连接」会使用当前选择的 Surface，运行时不会在失败后静默改用另一个 endpoint。
 
 ## 常用服务商预设
 
@@ -105,6 +146,8 @@ OpenAI-compatible Base URL 只填到服务商兼容入口，不额外拼接 `/ch
 ## OpenAI-compatible 与 LiteLLM 规则
 
 - OpenAI-compatible provider 的 channel `protocol` 通常是 `openai`。
+- `LLM_<CHANNEL>_API_SURFACE` 默认是 `chat_completions`；Responses-only 模型显式设为 `responses`。Responses 渠道要求协议及每个模型的实际 LiteLLM provider 都是 `openai`；直连 provider 从当前安装的 LiteLLM registry 获取，并由系统配置 API 返回给 Web 编辑器作为共同真源。因此显式 `anthropic/`、`gemini/`、`xai/` 以及未来新增的冲突前缀都会在所有配置入口被一致识别，网关自有的 `deepseek-ai/...`、`Qwen/...` 等带斜杠模型 ID 则会规范化到 `openai/<model>`。同一个规范化公开 alias 不得跨渠道混用 Chat 与 Responses，避免 Router 在不同 Surface deployment 间负载均衡。运行时保留公开模型别名 `openai/<model>`，并通过 LiteLLM 的 `openai/responses/<model>` 桥接调用 `/responses`。
+- 该设计与主流项目的显式路由方式一致：[LiteLLM](https://github.com/BerriAI/litellm/blob/main/litellm/responses/main.py) 提供 Chat-to-Responses bridge，[OpenAI Agents SDK](https://openai.github.io/openai-agents-python/models/) 使用独立 Responses/Chat 模型类，[LangChain](https://docs.langchain.com/oss/python/integrations/chat/openai) 使用 `use_responses_api` 显式选择并仅在已知条件下自动路由。DSA 不在请求失败后猜测 endpoint，避免双请求、重复计费及掩盖真实服务端错误。
 - 运行时模型名通常写成 `openai/<model>`；例如自定义网关里的 `gpt-5.5` 可以作为 `openai/gpt-5.5` 被 LiteLLM 路由。
 - `Qwen/...`、`deepseek-ai/...` 这类是服务商或模型仓库组织名前缀，不等同于 LiteLLM provider prefix；不要因为它们包含斜杠就误判为 `provider/model` 路由。
 - Base URL 只填官方或网关给出的兼容入口，通常到 `/v1`、`/api/v3` 或厂商文档指定路径；不要手动追加 `/chat/completions`。
@@ -118,6 +161,7 @@ OpenAI-compatible Base URL 只填到服务商兼容入口，不额外拼接 `/ch
 | --- | --- | --- |
 | `LLM_CHANNELS` | Variables 或 Secrets | 逗号分隔渠道名，例如 `deepseek,minimax,volcengine`。 |
 | `LLM_<CHANNEL>_PROTOCOL` | Variables 或 Secrets | 非敏感，通常为 `openai`、`deepseek`、`gemini`、`anthropic` 或 `ollama`。 |
+| `LLM_<CHANNEL>_API_SURFACE` | Variables 或 Secrets | 可选；`chat_completions`（默认）或 `responses`。Responses 当前只支持 `openai` 协议。 |
 | `LLM_<CHANNEL>_BASE_URL` | Variables 或 Secrets | 非敏感时优先放 Variables；私有网关地址可放 Secrets。 |
 | `LLM_<CHANNEL>_MODELS` | Variables 或 Secrets | 非敏感模型列表，逗号分隔。 |
 | `LLM_<CHANNEL>_ENABLED` | Variables 或 Secrets | 可选，未配置时默认启用；设为 `false` 可跳过该渠道。 |

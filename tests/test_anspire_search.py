@@ -49,6 +49,7 @@ from src.config import Config, get_config
 from src.search_service import (
     AnspireSearchProvider,
     SearchService,
+    _get_with_retry,
     get_search_service,
     reset_search_service,
 )
@@ -274,11 +275,18 @@ class TestAnspireSearchProvider(unittest.TestCase):
             
         mock_requests.get = MagicMock(side_effect=timeout_exc())
         
-        response = self.provider.search("测试查询", max_results=3)
+        with patch.object(_get_with_retry.retry, "sleep", return_value=None) as mock_sleep:
+            response = self.provider.search("测试查询", max_results=3)
         
         self.assertFalse(response.success)
         self.assertEqual(response.provider, "Anspire")
         self.assertEqual(len(response.results), 0)
+        self.assertEqual(mock_requests.get.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+        self.assertEqual(
+            [float(item.args[0]) for item in mock_sleep.call_args_list],
+            [1.0, 2.0],
+        )
         # 错误消息检查
         self.assertTrue("超时" in response.error_message or "Timeout" in response.error_message)
     
@@ -295,11 +303,18 @@ class TestAnspireSearchProvider(unittest.TestCase):
 
         mock_requests.get = MagicMock(side_effect=conn_exc())
         
-        response = self.provider.search("测试查询", max_results=3)
+        with patch.object(_get_with_retry.retry, "sleep", return_value=None) as mock_sleep:
+            response = self.provider.search("测试查询", max_results=3)
         
         self.assertFalse(response.success)
         self.assertEqual(response.provider, "Anspire")
         self.assertEqual(len(response.results), 0)
+        self.assertEqual(mock_requests.get.call_count, 3)
+        self.assertEqual(mock_sleep.call_count, 2)
+        self.assertEqual(
+            [float(item.args[0]) for item in mock_sleep.call_args_list],
+            [1.0, 2.0],
+        )
         self.assertTrue("网络" in response.error_message or "Connection" in response.error_message)
     
     @patch('src.search_service.requests')
@@ -444,18 +459,35 @@ class TestAnspireIntegration(unittest.TestCase):
     
     @classmethod
     def setUpClass(cls):
-        """Check if API Key is configured."""
+        """Check if API Key is configured and valid."""
         cls.api_keys = [k.strip() for k in os.getenv('ANSPIRE_API_KEYS', '').split(',') if k.strip()]
         cls.has_api_key = len(cls.api_keys) > 0
+        cls.has_valid_api_key = False  # 标记是否有有效的 API Key
         
         if cls.has_api_key:
             reset_search_service()
             cls.service = get_search_service()
+            
+            # 验证 API Key 是否有效
+            try:
+                # 查找 Anspire provider
+                for provider in cls.service._providers:
+                    if isinstance(provider, AnspireSearchProvider):
+                        # 执行一次简单的搜索验证
+                        test_response = provider.search("测试", max_results=1)
+                        if test_response.success:
+                            cls.has_valid_api_key = True
+                        break
+            except Exception:
+                cls.has_valid_api_key = False
 
-    @unittest.skipIf(
-        not os.environ.get("ANSPIRE_API_KEYS"),
-        "未设置 ANSPIRE_API_KEYS 环境变量，跳过集成测试"
-    )
+    def setUp(self):
+        """在每次测试前检查 API Key 是否有效"""
+        if not os.environ.get("ANSPIRE_API_KEYS"):
+            self.skipTest("未设置 ANSPIRE_API_KEYS 环境变量，跳过集成测试")
+        if not getattr(self.__class__, 'has_valid_api_key', False):
+            self.skipTest("ANSPIRE_API_KEYS 环境变量中的 API Key 无效，跳过集成测试")
+
     @pytest.mark.network
     def test_real_api_call_stock_news(self):
         """真实 API 调用测试 - 股票新闻搜索"""
@@ -494,10 +526,6 @@ class TestAnspireIntegration(unittest.TestCase):
             # snippet 可能为空，视具体实现而定
             # self.assertIsNotNone(result.snippet)
     
-    @unittest.skipIf(
-        not os.environ.get("ANSPIRE_API_KEYS"),
-        "未设置 ANSPIRE_API_KEYS 环境变量，跳过集成测试"
-    )
     @pytest.mark.network
     def test_real_api_call_general_search(self):
         """真实 API 调用测试 - 通用搜索"""

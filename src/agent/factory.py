@@ -111,6 +111,23 @@ def _normalize_skill_ids(
     return normalized, unknown
 
 
+def normalize_requested_skill_ids(config, skill_ids: List[str]) -> List[str]:
+    """Normalize API-requested Skill ids with the AgentFactory catalog rules."""
+    skill_manager = get_skill_manager(config)
+    available_skill_ids = {
+        str(getattr(skill, "name", "")).strip()
+        for skill in skill_manager.list_skills()
+        if str(getattr(skill, "name", "")).strip()
+    }
+    normalized, unknown = _normalize_skill_ids(
+        skill_ids,
+        available_skill_ids=available_skill_ids,
+    )
+    if unknown:
+        logger.warning("[AgentFactory] Ignoring unknown request skill ids: %s", unknown)
+    return normalized
+
+
 def _resolve_selected_skill_ids(
     *,
     requested_skills: Optional[List[str]],
@@ -349,6 +366,64 @@ def build_agent_executor(config=None, skills: Optional[List[str]] = None):
     return AgentExecutor(
         tool_registry=registry,
         llm_adapter=llm_adapter,
+        skill_instructions=prompt_state.skill_instructions,
+        default_skill_policy=prompt_state.default_skill_policy,
+        use_legacy_default_prompt=prompt_state.use_legacy_default_prompt,
+        max_steps=_coerce_config_int(
+            getattr(config, "agent_max_steps", AGENT_MAX_STEPS_DEFAULT),
+            AGENT_MAX_STEPS_DEFAULT,
+            field_name="agent_max_steps",
+        ),
+        timeout_seconds=_coerce_config_int(
+            getattr(config, "agent_orchestrator_timeout_s", 0),
+            0,
+            field_name="agent_orchestrator_timeout_s",
+        ),
+    )
+
+
+def build_agent_chat_executor(config=None, skills: Optional[List[str]] = None):
+    """Build the backend-neutral executor used only by Agent Chat endpoints."""
+    if config is None:
+        from src.config import get_config
+
+        config = get_config()
+
+    from src.agent.agent_backend import (
+        AgentBackendConfigError,
+        LiteLLMAgentBackend,
+        resolve_agent_backend_id,
+    )
+    from src.agent.chat_executor import AgentChatExecutor
+
+    backend_id = resolve_agent_backend_id(config)
+    arch = str(getattr(config, "agent_arch", "single") or "single").strip().lower()
+    if backend_id == "codex_app_server" and arch != "single":
+        raise AgentBackendConfigError(
+            "unsupported_agent_arch",
+            "Codex Agent currently supports single-agent Chat only",
+        )
+    if backend_id == "litellm" and arch == "multi":
+        return build_agent_executor(config, skills=skills)
+
+    registry = get_tool_registry()
+    prompt_state = resolve_skill_prompt_state(config, skills=skills)
+    if backend_id == "litellm":
+        from src.agent.llm_adapter import LLMToolAdapter
+
+        context_llm_adapter = LLMToolAdapter(config)
+        backend = LiteLLMAgentBackend(registry, context_llm_adapter)
+    else:
+        from src.agent.codex_agent_backend import CodexAgentBackend
+        from src.agent.tool_surface import ToolSurface
+
+        context_llm_adapter = None
+        backend = CodexAgentBackend(ToolSurface(registry), config)
+
+    return AgentChatExecutor(
+        backend=backend,
+        config=config,
+        context_llm_adapter=context_llm_adapter,
         skill_instructions=prompt_state.skill_instructions,
         default_skill_policy=prompt_state.default_skill_policy,
         use_legacy_default_prompt=prompt_state.use_legacy_default_prompt,

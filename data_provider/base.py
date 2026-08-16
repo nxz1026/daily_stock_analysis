@@ -76,6 +76,7 @@ def normalize_stock_code(stock_code: str) -> str:
     - 'SH600519'    -> '600519'   (strip SH prefix)
     - 'SH.600519'   -> '600519'   (strip SH. prefix)
     - 'SZ000001'    -> '000001'   (strip SZ prefix)
+    - 'SS600519'    -> '600519'   (strip legacy Yahoo Shanghai prefix)
     - 'SZ.000001'   -> '000001'   (strip SZ. prefix)
     - 'BJ920748'    -> '920748'   (strip BJ prefix, BSE)
     - 'BJ.920748'   -> '920748'   (strip BJ. prefix, BSE)
@@ -103,15 +104,15 @@ def normalize_stock_code(stock_code: str) -> str:
         if candidate.isdigit() and 1 <= len(candidate) <= 5:
             return f"HK{candidate.zfill(5)}"
 
-    # Strip SH/SZ prefix (e.g. SH600519 -> 600519)
-    if upper.startswith(('SH', 'SZ')) and not upper.startswith('SH.') and not upper.startswith('SZ.'):
+    # Strip SH/SZ/SS prefix (e.g. SH600519 -> 600519, SS600519 -> 600519)
+    if upper.startswith(('SH', 'SZ', 'SS')) and not upper.startswith(('SH.', 'SZ.', 'SS.')):
         candidate = code[2:]
         # Only strip if the remainder looks like a valid numeric code
         if candidate.isdigit() and len(candidate) in (5, 6):
             return candidate
 
-    # Strip dotted SH/SZ prefix (e.g. SH.600519 -> 600519)
-    if upper.startswith(('SH.', 'SZ.')):
+    # Strip dotted SH/SZ/SS prefix (e.g. SH.600519 -> 600519)
+    if upper.startswith(('SH.', 'SZ.', 'SS.')):
         candidate = code[3:]
         if candidate.isdigit() and len(candidate) in (5, 6):
             return candidate
@@ -163,7 +164,10 @@ def _is_hk_market(code: str) -> bool:
     """
     判定是否为港股代码。
 
-    支持 `HK00700` 及纯 5 位数字形式（A 股 ETF/股票常见为 6 位）。
+    支持 ``.HK`` 后缀、``HK00700`` 前缀形式，以及 4-5 位纯数字裸码
+    （A 股 ETF/股票为 6 位，与港股 4-5 位裸数字不冲突）。``YfinanceFetcher``
+    与 ``AkshareFetcher`` / ``LongbridgeFetcher`` 的 ``_is_hk_code`` 与本
+    函数对裸港股码的位数范围保持一致。
     """
     normalized = (code or "").strip().upper()
     if normalized.endswith(".HK"):
@@ -172,7 +176,7 @@ def _is_hk_market(code: str) -> bool:
     if normalized.startswith("HK"):
         digits = normalized[2:]
         return digits.isdigit() and 1 <= len(digits) <= 5
-    if normalized.isdigit() and len(normalized) == 5:
+    if normalized.isdigit() and 4 <= len(normalized) <= 5:
         return True
     return False
 
@@ -1149,6 +1153,7 @@ class DataFetcherManager:
           2. PytdxFetcher (Priority 2) - 通达信
           3. BaostockFetcher (Priority 3)
           4. YfinanceFetcher (Priority 4)
+          5. TencentFetcher (Priority 5) - A 股最终兜底
         """
         from src.config import get_config
         from .efinance_fetcher import EfinanceFetcher
@@ -1214,11 +1219,11 @@ class DataFetcherManager:
         with self._fetchers_lock:
             self._fetchers = [
                 efinance,
-                tencent,
                 akshare,
                 pytdx,
                 baostock,
                 yfinance,
+                tencent,
                 *optional_fetchers,
             ]
 
@@ -2952,10 +2957,78 @@ class DataFetcherManager:
             list(adapter_errors),
         )
 
-        # institution / capital_flow / dragon_tiger / boards: keep as not_supported
-        # for offshore markets — no equivalent data feed today.
-        for block in ("institution", "capital_flow", "dragon_tiger", "boards"):
+        # capital_flow / dragon_tiger / boards: no offshore data feed today -> not_supported.
+        for block in ("capital_flow", "dragon_tiger", "boards"):
             result_ctx[block] = self._build_fundamental_block(
+                "not_supported",
+                {},
+                [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
+                ["not supported for offshore market"],
+            )
+
+        # institution: tw (台股) has a free official 三大法人 (institutional net buy/sell)
+        # feed (TWSE T86 / TPEx OpenAPI); every other offshore market keeps not_supported.
+        # tw-only + strictly additive + fail-open: any error or no-data -> not_supported,
+        # which never interrupts the main analysis. Raw net figures only — no derived
+        # signal / score / schema (per the v2 scope confirmed on issue #1777).
+        tw_record = None
+        if market == "tw":
+            fetcher = getattr(self, "_tw_institutional_fetcher", None)
+            if fetcher is None:
+                # Wiring (import + construct) is a one-time op; a failure here is a
+                # programming / deploy bug, so log it LOUD (error). Still fail-open
+                # (never interrupt the main analysis — a hard requirement of #1777).
+                try:
+                    from data_provider.tw_institutional_fetcher import TwInstitutionalFetcher
+
+                    fetcher = TwInstitutionalFetcher()
+                    self._tw_institutional_fetcher = fetcher
+                except Exception as exc:  # noqa: BLE001 - wiring failure: loud but fail-open
+                    logger.error("[tw-inst] fetcher init failed (wiring bug?) code=%s: %s", stock_code, exc)
+                    fetcher = None
+            # fetch_timeout == 0 disables per-fetch fundamental fetches (same as valuation /
+            # bundle above, which gate on fetch_timeout); honour that for institution too so
+            # the FUNDAMENTAL_FETCH_TIMEOUT_SECONDS=0 config semantic is not bypassed.
+            if fetcher is not None and fetch_timeout > 0:
+                # The tw institution block is a WHOLE-MARKET download (~4-5s), far slower
+                # than the per-symbol quote/bundle fetches, and it is the LAST offshore
+                # block. When enabled, give it the full REMAINING stage budget rather than
+                # the ~3s per-fetch cap that starves it and makes the first/only stock of a
+                # run coin-flip between ok and not_supported. Bounded by the stage deadline
+                # via _run_with_retry, so it fails open (never blocks).
+                inst_timeout = max(stage_timeout - (time.time() - start_ts), 0.0)
+                if inst_timeout > 0:
+                    tw_record, inst_err, _inst_ms = self._run_with_retry(
+                        lambda: fetcher.get_institutional_net(stock_code),
+                        inst_timeout,
+                        "fundamental_tw_institution",
+                    )
+                    if inst_err:
+                        logger.warning("[tw-inst] fetch failed/timeout code=%s: %s", stock_code, inst_err)
+                else:
+                    tw_record = None
+        # status 'ok' only when the record carries all core net figures (a genuine 0 is
+        # kept — 0 is not None); None / missing core field / fetch failure -> not_supported.
+        _tw_core = ("foreign_net", "trust_net", "dealer_net", "total_net")
+        if tw_record is not None and all(tw_record.get(key) is not None for key in _tw_core):
+            institution_status = "ok"
+            result_ctx["institution"] = self._build_fundamental_block(
+                "ok",
+                {
+                    "foreign_net": tw_record.get("foreign_net"),
+                    "trust_net": tw_record.get("trust_net"),
+                    "dealer_net": tw_record.get("dealer_net"),
+                    "total_net": tw_record.get("total_net"),
+                    "unit": tw_record.get("unit"),
+                    "date": tw_record.get("date"),
+                    "source": tw_record.get("source"),
+                },
+                [{"provider": tw_record.get("source", "tw-institutional"), "result": "ok", "duration_ms": 0}],
+                [],
+            )
+        else:
+            institution_status = "not_supported"
+            result_ctx["institution"] = self._build_fundamental_block(
                 "not_supported",
                 {},
                 [{"provider": "fundamental_pipeline", "result": "not_supported", "duration_ms": 0}],
@@ -2968,7 +3041,7 @@ class DataFetcherManager:
             "valuation": result_ctx["valuation"].get("status", "not_supported"),
             "growth": growth_status,
             "earnings": earnings_status,
-            "institution": "not_supported",
+            "institution": institution_status,
             "capital_flow": "not_supported",
             "dragon_tiger": "not_supported",
             "boards": "not_supported",
@@ -2979,10 +3052,17 @@ class DataFetcherManager:
             result_ctx["source_chain"].extend(result_ctx[block].get("source_chain", []))
 
         active_statuses = {"valuation": valuation_status, "growth": growth_status, "earnings": earnings_status}
-        if all(value == "not_supported" for value in active_statuses.values()):
+        # tw institution (when present) counts toward the OVERALL status so a report that
+        # only has 三大法人 data still surfaces fundamentals (consumers key off the top-level
+        # status). missing_fields stays the original three blocks, so offshore markets
+        # without institution data are byte-identical (institution is not_supported there).
+        status_values = list(active_statuses.values())
+        if institution_status == "ok":
+            status_values.append("ok")
+        if all(value == "not_supported" for value in status_values):
             result_ctx["status"] = "not_supported"
             result_ctx["data_quality"] = "unavailable"
-        elif "failed" in active_statuses.values() or "partial" in active_statuses.values():
+        elif "failed" in status_values or "partial" in status_values:
             result_ctx["status"] = "partial"
             result_ctx["data_quality"] = "partial"
         else:

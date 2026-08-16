@@ -81,6 +81,7 @@ export interface SystemConfigResponse {
   configVersion: string;
   maskToken: string;
   items: SystemConfigItem[];
+  llmModelProviders?: string[];
   updatedAt?: string;
 }
 
@@ -102,6 +103,35 @@ export interface SetupStatusResponse {
   checks: SetupStatusCheck[];
 }
 
+export type GenerationBackendHealthStatus = 'not_tested' | 'passed' | 'failed' | 'skipped';
+export type GenerationBackendSmokeMode = 'text' | 'json';
+
+export interface GenerationBackendStatus {
+  backendId: string;
+  backendType: 'litellm' | 'local_cli';
+  providerId: string;
+  available: boolean;
+  healthStatus: GenerationBackendHealthStatus;
+  supportsJson: boolean;
+  supportsTools: boolean;
+  supportsStream: boolean;
+  supportsVision: boolean;
+  isPrimary: boolean;
+  fallbackTarget?: string | null;
+  maxConcurrency: number;
+  usageAvailable: boolean;
+  lastErrorCode?: string | null;
+  lastErrorMessage?: string | null;
+}
+
+export interface GenerationBackendStatusResponse {
+  primaryBackendId: string;
+  fallbackBackendId?: string | null;
+  primary: GenerationBackendStatus;
+  fallback?: GenerationBackendStatus | null;
+  backends: GenerationBackendStatus[];
+}
+
 export interface ExportSystemConfigResponse {
   content: string;
   configVersion: string;
@@ -111,6 +141,40 @@ export interface ExportSystemConfigResponse {
 export interface SystemConfigUpdateItem {
   key: string;
   value: string;
+}
+
+export interface GenerationBackendStatusPreviewRequest {
+  items?: SystemConfigUpdateItem[];
+  maskToken?: string;
+}
+
+export interface TestGenerationBackendRequest {
+  backendId?: string | null;
+  mode?: GenerationBackendSmokeMode;
+  items?: SystemConfigUpdateItem[];
+  maskToken?: string;
+  timeoutSeconds?: number | null;
+}
+
+export interface TestGenerationBackendResponse {
+  success: boolean;
+  mode: GenerationBackendSmokeMode;
+  message: string;
+  status: GenerationBackendStatus;
+}
+
+export interface AgentBackendStatusResponse {
+  backend: 'litellm' | 'codex_app_server' | string;
+  available: boolean;
+  experimental: boolean;
+  version?: string | null;
+  errorCode?: string | null;
+  message?: string | null;
+}
+
+export interface AgentBackendStatusPreviewRequest {
+  items?: SystemConfigUpdateItem[];
+  maskToken?: string;
 }
 
 export interface UpdateSystemConfigRequest {
@@ -175,6 +239,7 @@ export interface SchedulerRunNowResponse {
 export interface TestLLMChannelRequest {
   name: string;
   protocol: string;
+  apiSurface?: LLMApiSurface;
   baseUrl?: string;
   apiKey?: string;
   models: string[];
@@ -183,6 +248,8 @@ export interface TestLLMChannelRequest {
   capabilityChecks?: LLMCapabilityCheck[];
   useSavedSecret?: boolean;
 }
+
+export type LLMApiSurface = 'chat_completions' | 'responses';
 
 export type LLMCapabilityCheck = 'json' | 'tools' | 'vision' | 'stream';
 
@@ -205,6 +272,7 @@ export interface TestLLMChannelResponse {
   retryable?: boolean | null;
   details?: Record<string, unknown>;
   resolvedProtocol?: string | null;
+  resolvedApiSurface?: LLMApiSurface | null;
   resolvedModel?: string | null;
   latencyMs?: number | null;
   capabilityResults?: Partial<Record<LLMCapabilityCheck, LLMCapabilityCheckResult>>;
@@ -213,6 +281,7 @@ export interface TestLLMChannelResponse {
 export type NotificationTestChannel =
   | 'wechat'
   | 'feishu'
+  | 'dingtalk'
   | 'telegram'
   | 'email'
   | 'pushover'

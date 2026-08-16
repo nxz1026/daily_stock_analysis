@@ -9,7 +9,7 @@
 1. Windows 或 macOS 电脑。
 2. 一个模型服务密钥（Key），推荐从下面任选一个：
    - [Anspire Open](https://open.anspire.cn/?share_code=QFBC0FYC)：支持全球主流模型，一个 Key 可同时用于模型和新闻搜索，第一次配置最省事。
-   - [AIHubMix](https://aihubmix.com/?aff=CfMq)：支持全球主流模型，适合想在一个平台切换多种模型的用户。
+   - [AIHubMix](https://inferera.com/?aff=CfMq)：支持全球主流模型，适合想在一个平台切换多种模型的用户。
 3. 想分析的股票代码，例如 `600519,hk00700,AAPL`。
 
 ## 1. 下载客户端
@@ -35,7 +35,7 @@
 
 - Windows 安装包：双击 `.exe`，按提示安装，安装目录用默认位置即可。
 - Windows 免安装包：解压 `.zip`，双击 `Daily Stock Analysis.exe`。
-- macOS：双击 `.dmg`，把应用拖到 `Applications`。如果提示来自未验证开发者，在系统设置的隐私与安全性里允许打开。
+- macOS：双击 `.dmg`，把应用拖到 `Applications`。当前 DMG 未经 Apple Developer 签名和公证，Gatekeeper 仍可能阻止启动；仅对 GitHub Releases 官方附件尝试在“隐私与安全性”中允许打开，完整限制与排查方式见 `docs/desktop-package.md`。
 
 macOS 用户升级前建议先在客户端设置里导出一次配置备份。
 
@@ -59,7 +59,7 @@ macOS 用户升级前建议先在客户端设置里导出一次配置备份。
 
 ### 方案 B：AIHubMix
 
-1. 打开 [AIHubMix](https://aihubmix.com/?aff=CfMq)，注册 / 登录后创建 API Key。
+1. 打开 [AIHubMix](https://inferera.com/?aff=CfMq)，注册 / 登录后创建 API Key。
 2. 回到客户端，在快速添加渠道里选择 `AIHubmix（聚合平台）`。
 3. 粘贴 API Key。
 4. 模型名选择控制台里已开通的模型；不确定就先选控制台推荐模型。

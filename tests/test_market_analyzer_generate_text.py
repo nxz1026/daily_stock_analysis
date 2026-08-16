@@ -21,7 +21,6 @@ for _mod in ("litellm", "google.generativeai", "google.genai", "anthropic"):
         sys.modules[_mod] = MagicMock()
 
 import pytest
-from unittest.mock import PropertyMock
 
 
 @pytest.fixture(autouse=True)
@@ -84,6 +83,26 @@ _OPENAI_COMPATIBILITY_PAYLOAD_FIXTURES = [
             "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
         },
         "list response",
+    ),
+    # Repro case 3 (Issue #2013): MiniMax reasoning and final text share
+    # content_blocks.  Only the final text may reach the strict JSON parser.
+    (
+        "openai/MiniMax-M3",
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "content_blocks": [
+                            {"type": "reasoning", "text": "I should analyze the stock first."},
+                            {"type": "text", "text": '{"sentiment_score": 72}'},
+                        ],
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        },
+        '{"sentiment_score": 72}',
     ),
 ]
 
@@ -187,12 +206,20 @@ class TestAnalyzerGenerateText:
         assert result == "复盘"
         mock_persist.assert_not_called()
 
-    def test_codex_cli_is_available_without_litellm_api_keys(self):
+    @pytest.mark.parametrize(
+        ("generation_backend", "executable_name"),
+        [
+            ("codex_cli", "codex"),
+            ("claude_code_cli", "claude"),
+            ("opencode_cli", "opencode"),
+        ],
+    )
+    def test_local_cli_is_available_without_litellm_api_keys(self, generation_backend, executable_name):
         analyzer = self._make_analyzer()
         analyzer._litellm_available = False
         analyzer._router = None
         analyzer._config_override = SimpleNamespace(
-            generation_backend="codex_cli",
+            generation_backend=generation_backend,
             generation_fallback_backend="",
             generation_backend_timeout_seconds=300,
             generation_backend_max_output_bytes=1048576,
@@ -200,7 +227,7 @@ class TestAnalyzerGenerateText:
             local_cli_backend_max_concurrency=1,
         )
 
-        with patch("src.llm.local_cli_backend.shutil.which", return_value="/usr/bin/codex"), \
+        with patch("src.llm.local_cli_backend.shutil.which", return_value=f"/usr/bin/{executable_name}"), \
              patch("src.llm.local_cli_backend.os.access", return_value=True):
             assert analyzer.get_generation_backend_config_error() is None
             assert analyzer.is_available() is True
@@ -1407,7 +1434,11 @@ class TestAnalyzerGenerateText:
     @pytest.mark.parametrize(
         "provider_model,response_payload,expected_text",
         _OPENAI_COMPATIBILITY_PAYLOAD_FIXTURES,
-        ids=["issue1279-message-content-null", "issue1279-message-content-list"],
+        ids=[
+            "issue1279-message-content-null",
+            "issue1279-message-content-list",
+            "issue2013-minimax-reasoning-block",
+        ],
     )
     def test_call_litellm_extracts_external_provider_text_shapes(self, provider_model, response_payload, expected_text):
         analyzer = self._make_analyzer()
@@ -1425,6 +1456,166 @@ class TestAnalyzerGenerateText:
         assert text == expected_text
         assert model_used == provider_model
         _assert_usage_contains(usage, response_payload["usage"])
+
+    def test_call_litellm_minimax_reasoning_only_blocks_fall_back_to_message_content(self):
+        analyzer = self._make_analyzer()
+        analyzer._config_override = SimpleNamespace(
+            litellm_model="openai/MiniMax-M3",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+        )
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    content_blocks=[
+                        SimpleNamespace(type="thinking", text="Internal reasoning"),
+                    ],
+                    message=SimpleNamespace(content='{"sentiment_score": 72}'),
+                )
+            ],
+            usage=None,
+        )
+
+        with patch.object(analyzer, "_dispatch_litellm_completion", return_value=response):
+            text, model_used, _usage = analyzer._call_litellm(
+                "prompt",
+                {"max_tokens": 128, "temperature": 0.2},
+            )
+
+        assert text == '{"sentiment_score": 72}'
+        assert model_used == "openai/MiniMax-M3"
+
+    def test_call_litellm_minimax_strips_leading_think_wrapper(self):
+        analyzer = self._make_analyzer()
+        analyzer._config_override = SimpleNamespace(
+            litellm_model="openai/MiniMax-M3",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+        )
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    content_blocks=None,
+                    message=SimpleNamespace(
+                        content='<think>Internal reasoning</think>\n{"sentiment_score": 72}'
+                    ),
+                )
+            ],
+            usage=None,
+        )
+
+        with patch.object(analyzer, "_dispatch_litellm_completion", return_value=response):
+            text, model_used, _usage = analyzer._call_litellm(
+                "prompt",
+                {"max_tokens": 128, "temperature": 0.2},
+                response_validator=analyzer._validate_json_response,
+            )
+
+        assert text == '{"sentiment_score": 72}'
+        assert model_used == "openai/MiniMax-M3"
+
+    def test_call_litellm_preserves_think_markup_inside_json_string(self):
+        analyzer = self._make_analyzer()
+        analyzer._config_override = SimpleNamespace(
+            litellm_model="openai/MiniMax-M3",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+        )
+        expected = '{"analysis_summary":"literal <think>text</think>"}'
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    content_blocks=None,
+                    message=SimpleNamespace(content=expected),
+                )
+            ],
+            usage=None,
+        )
+
+        with patch.object(analyzer, "_dispatch_litellm_completion", return_value=response):
+            text, model_used, _usage = analyzer._call_litellm(
+                "prompt",
+                {"max_tokens": 128, "temperature": 0.2},
+                response_validator=analyzer._validate_json_response,
+            )
+
+        assert text == expected
+        assert model_used == "openai/MiniMax-M3"
+
+    def test_call_litellm_minimax_stream_ignores_reasoning_blocks(self):
+        analyzer = self._make_analyzer()
+        analyzer._config_override = SimpleNamespace(
+            litellm_model="openai/MiniMax-M3",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+        )
+
+        def stream_response():
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=[
+                                {"type": "reasoning", "text": "Internal reasoning"},
+                                {"type": "text", "text": '{"sentiment_score": '},
+                            ]
+                        )
+                    )
+                ],
+                usage=None,
+            )
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=[{"type": "text", "text": "72}"}]
+                        )
+                    )
+                ],
+                usage=None,
+            )
+
+        with patch.object(analyzer, "_dispatch_litellm_completion", return_value=stream_response()):
+            text, model_used, _usage = analyzer._call_litellm(
+                "prompt",
+                {"max_tokens": 128, "temperature": 0.2},
+                stream=True,
+                response_validator=analyzer._validate_json_response,
+            )
+
+        assert text == '{"sentiment_score": 72}'
+        assert model_used == "openai/MiniMax-M3"
+
+    def test_call_litellm_minimax_stream_strips_split_think_wrapper(self):
+        analyzer = self._make_analyzer()
+        analyzer._config_override = SimpleNamespace(
+            litellm_model="openai/MiniMax-M3",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+        )
+
+        def stream_response():
+            for content in (
+                "<thi",
+                "nk>Internal reasoning</think>",
+                '{"sentiment_score": ',
+                "72}",
+            ):
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content=content))],
+                    usage=None,
+                )
+
+        with patch.object(analyzer, "_dispatch_litellm_completion", return_value=stream_response()):
+            text, model_used, _usage = analyzer._call_litellm(
+                "prompt",
+                {"max_tokens": 128, "temperature": 0.2},
+                stream=True,
+                response_validator=analyzer._validate_json_response,
+            )
+
+        assert text == '{"sentiment_score": 72}'
+        assert model_used == "openai/MiniMax-M3"
 
     def test_call_litellm_falls_back_to_message_content_when_blocks_empty(self):
         analyzer = self._make_analyzer()
@@ -2636,7 +2827,8 @@ class TestMarketAnalyzerBypassFix:
         assert "A-share Market Recap" in result
         assert "### 1. Market Summary" in result
         assert "### 3. Breadth & Liquidity" in result
-        assert "Turnover (CNY 100m)" in result
+        assert "- **Market Signal**:" in result
+        assert "Turnover 14567 (CNY 100m)" in result
         assert "### 4. Sector / Theme Highlights" in result
         assert "### 6. Strategy Framework" in result
         assert "### 一、市场总结" not in result
@@ -2863,6 +3055,139 @@ Sector text.
         assert "AI算力板块走强" not in result
         assert "新闻。" in result
         assert "算力产业链延续活跃" not in result
+
+    def test_inject_data_into_review_appends_sector_block_when_heading_drifts(self):
+        from src.market_analyzer import MarketOverview
+
+        ma = self._make_market_analyzer_with_mock_generate_text(return_value="review")
+        overview = MarketOverview(
+            date="2026-03-05",
+            top_sectors=[{"name": "AI算力", "change_pct": 3.25}],
+            bottom_sectors=[{"name": "煤炭", "change_pct": -1.12}],
+        )
+        review = """## 2026-03-05 大盘复盘
+
+### 今日主线观察
+正文。
+"""
+
+        result = ma._inject_data_into_review(review, overview)
+
+        assert "### 三、板块主线" in result
+        assert "#### 行业板块领涨 Top 5" in result
+        assert "| 1 | AI算力 | +3.25% |" in result
+        assert "#### 行业板块领跌 Top 5" in result
+        assert "| 1 | 煤炭 | -1.12% |" in result
+
+    @pytest.mark.parametrize(
+        ("region", "profile_name", "index_code", "index_name", "report_title"),
+        [
+            ("us", "US_PROFILE", "SPX", "S&P 500", "US Market Recap"),
+            ("hk", "HK_PROFILE", "HSI", "Hang Seng Index", "HK Market Recap"),
+        ],
+    )
+    def test_inject_data_into_review_keeps_market_signal_for_markets_without_breadth(
+        self, region, profile_name, index_code, index_name, report_title
+    ):
+        import src.core.market_profile as market_profile
+        from src.market_analyzer import MarketIndex, MarketOverview
+
+        ma = self._make_market_analyzer_with_mock_generate_text(return_value="review")
+        ma.region = region
+        ma.profile = getattr(market_profile, profile_name)
+        ma.config.report_language = "en"
+        overview = MarketOverview(
+            date="2026-03-06",
+            indices=[MarketIndex(code=index_code, name=index_name, current=5000.0, change_pct=0.5)],
+        )
+        snapshot = ma.build_market_light_snapshot(overview)
+        review = f"""## 2026-03-06 {report_title}
+
+### 1. Market Summary
+Summary text.
+
+### 2. Major Indices
+Index text.
+"""
+
+        result = ma._inject_data_into_review(review, overview)
+
+        assert (
+            f"- **Market Signal**: {snapshot['score']}/100 "
+            f"({snapshot['temperature_label']}, {snapshot['label']})"
+        ) in result
+        assert f"- **Drivers**: {'; '.join(snapshot['reasons'])}" in result
+        assert f"- **Guidance**: {snapshot['guidance']}" in result
+        assert "- **Breadth**:" not in result
+
+    @pytest.mark.parametrize(
+        ("region", "profile_name", "index_code", "index_name"),
+        [
+            ("us", "US_PROFILE", "SPX", "S&P 500"),
+            ("hk", "HK_PROFILE", "HSI", "Hang Seng Index"),
+        ],
+    )
+    def test_template_review_keeps_market_signal_for_markets_without_breadth(
+        self, region, profile_name, index_code, index_name
+    ):
+        import src.core.market_profile as market_profile
+        from src.market_analyzer import MarketIndex, MarketOverview
+
+        ma = self._make_market_analyzer_with_mock_generate_text(return_value="review")
+        ma.region = region
+        ma.profile = getattr(market_profile, profile_name)
+        ma.config.report_language = "en"
+        overview = MarketOverview(
+            date="2026-03-06",
+            indices=[MarketIndex(code=index_code, name=index_name, current=5000.0, change_pct=0.5)],
+        )
+        snapshot = ma.build_market_light_snapshot(overview)
+
+        result = ma._generate_template_review(overview, [])
+
+        assert f"- **Market Signal**: {snapshot['score']}/100" in result
+        assert f"- **Guidance**: {snapshot['guidance']}" in result
+        assert "- **Breadth**:" not in result
+
+    def test_template_review_keeps_market_signal_for_hk_without_breadth_in_chinese(self):
+        from src.core.market_profile import HK_PROFILE
+        from src.market_analyzer import MarketIndex, MarketOverview
+
+        ma = self._make_market_analyzer_with_mock_generate_text(return_value="review")
+        ma.region = "hk"
+        ma.profile = HK_PROFILE
+        ma.config.report_language = "zh"
+        overview = MarketOverview(
+            date="2026-03-06",
+            indices=[MarketIndex(code="HSI", name="恒生指数", current=18200.0, change_pct=1.2)],
+        )
+        snapshot = ma.build_market_light_snapshot(overview)
+
+        result = ma._generate_template_review(overview, [])
+
+        assert f"- **盘面信号**：{snapshot['score']}/100" in result
+        assert f"- **操作建议**：{snapshot['guidance']}" in result
+        assert "| 上涨/下跌/平盘 |" not in result
+
+    def test_generate_template_review_uses_configured_red_up_markers_in_english_fallback(self):
+        from src.market_analyzer import MarketIndex, MarketOverview
+
+        ma = self._make_market_analyzer_with_mock_generate_text(return_value="review")
+        ma.region = "us"
+        ma.config.report_language = "en"
+        ma.config.market_review_color_scheme = "red_up"
+        overview = MarketOverview(
+            date="2026-07-31",
+            indices=[
+                MarketIndex(code="SPX", name="S&P 500", current=5000.0, change_pct=0.8),
+                MarketIndex(code="IXIC", name="Nasdaq", current=18000.0, change_pct=-0.2),
+            ],
+        )
+
+        result = ma._generate_template_review(overview, [])
+
+        assert "- **S&P 500**: 5000.00 (🔴 +0.80%)" in result
+        assert "- **Nasdaq**: 18000.00 (🟢 -0.20%)" in result
 
     def test_market_review_payload_sections_skip_top_report_title(self):
         from src.market_analyzer import MarketAnalyzer
@@ -3114,6 +3439,26 @@ Sector text.
 
         assert "breadth" not in payload
         assert payload["indices"][0]["code"] == "SPX"
+        assert payload["color_scheme"] == "green_up"
+
+    def test_market_review_payload_persists_red_up_color_scheme(self):
+        from src.market_analyzer import MarketIndex, MarketOverview
+
+        ma = self._make_market_analyzer_with_mock_generate_text(return_value="复盘结果")
+        ma.config.market_review_color_scheme = "red_up"
+
+        payload = ma.build_market_review_payload(
+            MarketOverview(
+                date="2026-08-01",
+                indices=[
+                    MarketIndex(code="000001", name="上证指数", current=3500, change_pct=0.8),
+                ],
+            ),
+            [],
+            "A股复盘报告",
+        )
+
+        assert payload["color_scheme"] == "red_up"
 
     def test_market_review_payload_omits_breadth_for_cn_market_without_available_stats(self):
         from src.market_analyzer import MarketIndex, MarketOverview

@@ -13,9 +13,8 @@ const {
   importEnv,
   runSchedulerNow,
   updateSystemConfig,
-  alphasiftEnable,
-  alphasiftInstall,
-  notifyAlphaSiftConfigChanged,
+  screeningEnable,
+  notifyScreeningConfigChanged,
   notifySystemConfigChanged,
   desktopCheckForUpdates,
   desktopGetUpdateState,
@@ -44,9 +43,8 @@ const {
   importEnv: vi.fn(),
   runSchedulerNow: vi.fn(),
   updateSystemConfig: vi.fn(),
-  alphasiftEnable: vi.fn(),
-  alphasiftInstall: vi.fn(),
-  notifyAlphaSiftConfigChanged: vi.fn(),
+  screeningEnable: vi.fn(),
+  notifyScreeningConfigChanged: vi.fn(),
   notifySystemConfigChanged: vi.fn(),
   desktopCheckForUpdates: vi.fn(),
   desktopGetUpdateState: vi.fn(),
@@ -69,6 +67,7 @@ const {
   webBuildInfoMock: {
     version: '3.11.0',
     rawVersion: '3.11.0',
+    revision: 'abc123def456',
     buildId: 'build-20260329-021530Z',
     buildTime: '2026-03-29T02:15:30.000Z',
     isFallbackVersion: false,
@@ -99,12 +98,11 @@ vi.mock('../../api/analysis', () => ({
   },
 }));
 
-vi.mock('../../api/alphasift', () => ({
-  alphasiftApi: {
-    enable: (...args: unknown[]) => alphasiftEnable(...args),
-    install: (...args: unknown[]) => alphasiftInstall(...args),
+vi.mock('../../api/screening', () => ({
+  screeningApi: {
+    enable: (...args: unknown[]) => screeningEnable(...args),
   },
-  notifyAlphaSiftConfigChanged: (...args: unknown[]) => notifyAlphaSiftConfigChanged(...args),
+  notifyScreeningConfigChanged: (...args: unknown[]) => notifyScreeningConfigChanged(...args),
   notifySystemConfigChanged: (...args: unknown[]) => notifySystemConfigChanged(...args),
 }));
 
@@ -127,18 +125,55 @@ vi.mock('../../components/settings', () => ({
   LLMChannelEditor: ({
     items,
     onSaved,
+    onDraftItemsChange,
   }: {
     items: Array<{ key: string; value: string }>;
     onSaved: (items: Array<{ key: string; value: string }>) => void;
+    onDraftItemsChange?: (items: Array<{ key: string; value: string }>) => void;
   }) => (
     <div>
       <div data-testid="llm-channel-editor-items">{items.map((item) => item.key).join(',')}</div>
+      <button
+        type="button"
+        onClick={() => onDraftItemsChange?.([
+          { key: 'LLM_CHANNELS', value: 'draft,backup' },
+          { key: 'LLM_DRAFT_API_SURFACE', value: 'responses' },
+          { key: 'LITELLM_MODEL', value: 'openai/draft-model' },
+          { key: 'GENERATION_BACKEND', value: 'codex_cli' },
+        ])}
+      >
+        emit llm draft
+      </button>
       <button
         type="button"
         onClick={() => onSaved([{ key: 'LLM_CHANNELS', value: 'primary,backup' }])}
       >
         save llm channels
       </button>
+    </div>
+  ),
+  GenerationBackendStatusPanel: ({ items }: { items: Array<{ key: string; value: string }> }) => (
+    <div data-testid="generation-backend-status-items">
+      {items.map((item) => `${item.key}=${item.value}`).join('|')}
+    </div>
+  ),
+  AgentBackendStatusPanel: ({
+    items,
+    selectedBackend,
+    agentArch,
+    onUseSingleAgent,
+  }: {
+    items: Array<{ key: string; value: string }>;
+    selectedBackend: string;
+    agentArch: string;
+    onUseSingleAgent: () => void;
+  }) => (
+    <div data-testid="agent-backend-status-panel-mock">
+      <span data-testid="agent-backend-status-items">
+        {items.map((item) => `${item.key}=${item.value}`).join('|')}
+      </span>
+      <span>{selectedBackend}:{agentArch}</span>
+      <button type="button" onClick={onUseSingleAgent}>切换为单 Agent</button>
     </div>
   ),
   NotificationTestPanel: ({ items }: { items: Array<{ key: string; value: string }> }) => (
@@ -188,6 +223,8 @@ vi.mock('../../components/settings', () => ({
   ),
   SettingsField: ({
     item,
+    disabled,
+    issues = [],
   }: {
     item: {
       key: string;
@@ -195,9 +232,15 @@ vi.mock('../../components/settings', () => ({
         description?: string;
         options?: Array<string | { label: string; value: string }>;
       };
-    };
+      };
+    disabled?: boolean;
+    issues?: Array<{ code: string; message: string }>;
   }) => (
-    <div data-testid={`settings-field-${item.key}`}>
+    <div
+      data-testid={`settings-field-${item.key}`}
+      data-disabled={disabled ? 'true' : 'false'}
+      data-issues={issues.map((issue) => issue.code).join(',')}
+    >
       <div>{item.key}</div>
       {item.schema?.description ? <p>{item.schema.description}</p> : null}
       {item.schema?.options?.map((option) => {
@@ -422,6 +465,32 @@ function buildSystemConfigState(overrides: ConfigOverride = {}) {
   };
 }
 
+function buildAgentItem(
+  key: string,
+  value: string,
+  displayOrder: number,
+  uiControl: 'select' | 'number' | 'text' = 'text',
+) {
+  return {
+    key,
+    value,
+    rawValueExists: true,
+    isMasked: false,
+    schema: {
+      key,
+      category: 'agent',
+      dataType: uiControl === 'number' ? 'integer' : 'string',
+      uiControl,
+      isSensitive: false,
+      isRequired: false,
+      isEditable: true,
+      options: uiControl === 'select' ? [] : [],
+      validation: {},
+      displayOrder,
+    },
+  };
+}
+
 function createDeferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -439,6 +508,7 @@ describe('SettingsPage', () => {
     Object.assign(webBuildInfoMock, {
       version: '3.11.0',
       rawVersion: '3.11.0',
+      revision: 'abc123def456',
       buildId: 'build-20260329-021530Z',
       buildTime: '2026-03-29T02:15:30.000Z',
       isFallbackVersion: false,
@@ -514,15 +584,10 @@ describe('SettingsPage', () => {
     updateSystemConfig.mockResolvedValue({
       success: true,
       configVersion: 'v2',
-      updatedKeys: ['ALPHASIFT_ENABLED'],
+      updatedKeys: ['SCREENING_ENABLED'],
       reloadTriggered: true,
     });
-    alphasiftInstall.mockResolvedValue({
-      installed: true,
-      alreadyInstalled: true,
-      installSpecIsDefault: true,
-    });
-    alphasiftEnable.mockResolvedValue(undefined);
+    screeningEnable.mockResolvedValue(undefined);
     desktopGetUpdateState.mockResolvedValue({
       status: 'idle',
       currentVersion: '3.12.0',
@@ -560,6 +625,8 @@ describe('SettingsPage', () => {
   });
 
   it('renders first-run setup checks and routes setup actions', async () => {
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'base' }));
+
     render(<SettingsPage />);
 
     expect(await screen.findByTestId('first-run-setup-card')).toBeInTheDocument();
@@ -578,6 +645,7 @@ describe('SettingsPage', () => {
 
   it('keeps first-run setup summary neutral while setup status is loading', async () => {
     getSetupStatus.mockImplementation(() => new Promise(() => undefined));
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'base' }));
 
     render(<SettingsPage />);
 
@@ -590,6 +658,7 @@ describe('SettingsPage', () => {
 
   it('keeps first-run setup summary neutral when setup status fails', async () => {
     getSetupStatus.mockRejectedValue(new Error('setup status unavailable'));
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'base' }));
 
     render(<SettingsPage />);
 
@@ -689,6 +758,8 @@ describe('SettingsPage', () => {
   });
 
   it('runs a brief setup smoke analysis with the first watchlist stock', async () => {
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'base' }));
+
     render(<SettingsPage />);
 
     await screen.findByText('基础配置已满足最小可用分析');
@@ -703,6 +774,61 @@ describe('SettingsPage', () => {
       selectionSource: 'manual',
     }));
     expect(await screen.findByText(/task-setup-smoke/)).toBeInTheDocument();
+  });
+
+  it('allows brief setup smoke when only the Agent channel is incomplete', async () => {
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'base' }));
+    getSetupStatus.mockResolvedValue({
+      isComplete: false,
+      readyForSmoke: true,
+      requiredMissingKeys: ['llm_agent'],
+      nextStepKey: 'llm_agent',
+      checks: [
+        {
+          key: 'llm_primary',
+          title: 'LLM 主渠道',
+          category: 'ai_model',
+          required: true,
+          status: 'configured',
+          message: '已启用 Claude Code CLI 本地生成 Backend（experimental/limited）。',
+          nextStep: null,
+        },
+        {
+          key: 'llm_agent',
+          title: 'Agent 渠道',
+          category: 'agent',
+          required: true,
+          status: 'needs_action',
+          message: 'Agent 工具调用需要 LiteLLM 模型配置；local CLI 主生成方式不会被自动继承。',
+          nextStep: '如需使用 Ask-Stock Agent，请配置 LiteLLM 模型。',
+        },
+        {
+          key: 'stock_list',
+          title: '自选股',
+          category: 'base',
+          required: true,
+          status: 'configured',
+          message: '已配置 1 只股票。',
+          nextStep: null,
+        },
+      ],
+    });
+
+    render(<SettingsPage />);
+
+    await screen.findByText('还缺少 1 项：Agent 渠道');
+    expect(screen.getByRole('button', { name: '简短试跑' })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole('button', { name: '简短试跑' }));
+
+    await waitFor(() => expect(analyzeAsync).toHaveBeenCalledWith({
+      stockCode: 'SH600000',
+      reportType: 'brief',
+      asyncMode: true,
+      notify: false,
+      originalQuery: 'SH600000',
+      selectionSource: 'manual',
+    }));
   });
 
   it('shows missing setup items and lets the user reopen the setup check', async () => {
@@ -723,6 +849,7 @@ describe('SettingsPage', () => {
         },
       ],
     });
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'base' }));
 
     render(<SettingsPage />);
 
@@ -742,7 +869,7 @@ describe('SettingsPage', () => {
 
     expect(await screen.findByRole('heading', { name: '版本信息' })).toBeInTheDocument();
     expect(screen.getByText('3.11.0')).toBeInTheDocument();
-    expect(screen.getByText('build-20260329-021530Z')).toBeInTheDocument();
+    expect(screen.getByText('abc123def456')).toBeInTheDocument();
     expect(screen.getByText('2026-03-29T02:15:30.000Z')).toBeInTheDocument();
   });
 
@@ -804,13 +931,15 @@ describe('SettingsPage', () => {
     expect(screen.queryByText('发现新版本')).not.toBeInTheDocument();
   });
 
-  it('falls back to build identifier when package version is still placeholder', () => {
+  it('uses an explicit development label instead of presenting a build ID as the version', () => {
     expect(resolveWebBuildInfo({
       packageVersion: '0.0.0',
+      revision: 'abc123def456',
       buildTimestamp: '2026-03-29T02:15:30.000Z',
     })).toEqual({
-      version: 'build-20260329-021530Z',
+      version: 'development',
       rawVersion: '0.0.0',
+      revision: 'abc123def456',
       buildId: 'build-20260329-021530Z',
       buildTime: '2026-03-29T02:15:30.000Z',
       isFallbackVersion: true,
@@ -819,8 +948,9 @@ describe('SettingsPage', () => {
 
   it('renders fallback version hint when package version is placeholder', async () => {
     Object.assign(webBuildInfoMock, {
-      version: 'build-20260329-021530Z',
+      version: 'development',
       rawVersion: '0.0.0',
+      revision: 'abc123def456',
       buildId: 'build-20260329-021530Z',
       buildTime: '2026-03-29T02:15:30.000Z',
       isFallbackVersion: true,
@@ -829,8 +959,9 @@ describe('SettingsPage', () => {
     render(<SettingsPage />);
 
     expect(await screen.findByRole('heading', { name: '版本信息' })).toBeInTheDocument();
-    expect(screen.getByText(/当前 package\.json 仍为占位版本 0\.0\.0/)).toBeInTheDocument();
-    expect(screen.getAllByText('build-20260329-021530Z')).toHaveLength(2);
+    expect(screen.getByText(/当前构建未提供发布版本/)).toBeInTheDocument();
+    expect(screen.getByText('development')).toBeInTheDocument();
+    expect(screen.getByText('abc123def456')).toBeInTheDocument();
   });
 
   it('resets local drafts from the page header button', () => {
@@ -918,6 +1049,47 @@ describe('SettingsPage', () => {
     expect(screen.getByText('AGENT_DEEP_RESEARCH_BUDGET')).toBeInTheDocument();
     expect(screen.getByText('AGENT_EVENT_MONITOR_ENABLED')).toBeInTheDocument();
     expect(settingsPanelErrorBoundary).toHaveBeenCalledWith('Agent 设置');
+  });
+
+  it('integrates one Agent backend selector and keeps Codex limits editable as unsaved draft actions', () => {
+    const configState = buildSystemConfigState();
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({
+      activeCategory: 'agent',
+      hasDirty: true,
+      dirtyCount: 2,
+      getChangedItems: () => [
+        { key: 'AGENT_BACKEND', value: 'codex_app_server' },
+        { key: 'AGENT_ARCH', value: 'multi' },
+      ],
+      itemsByCategory: {
+        ...configState.itemsByCategory,
+        agent: [
+          buildAgentItem('AGENT_BACKEND', 'codex_app_server', 1, 'select'),
+          buildAgentItem('AGENT_GENERATION_BACKEND', 'auto', 2, 'select'),
+          buildAgentItem('AGENT_LITELLM_MODEL', 'openai/gpt-4o-mini', 3),
+          buildAgentItem('AGENT_MAX_STEPS', '10', 4, 'number'),
+          buildAgentItem('AGENT_ARCH', 'multi', 5, 'select'),
+          buildAgentItem('AGENT_ORCHESTRATOR_TIMEOUT_S', '600', 6, 'number'),
+        ],
+      },
+    }));
+
+    render(<SettingsPage />);
+
+    expect(screen.getByTestId('settings-field-AGENT_BACKEND')).toBeInTheDocument();
+    expect(screen.queryByTestId('settings-field-AGENT_GENERATION_BACKEND')).not.toBeInTheDocument();
+    expect(screen.getByTestId('settings-field-AGENT_MAX_STEPS')).toHaveAttribute('data-disabled', 'false');
+    expect(screen.getByTestId('settings-field-AGENT_ARCH')).toHaveAttribute(
+      'data-issues',
+      'unsupported_agent_arch',
+    );
+    expect(screen.getByTestId('agent-backend-status-items')).toHaveTextContent(
+      'AGENT_BACKEND=codex_app_server|AGENT_ARCH=multi',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '切换为单 Agent' }));
+    expect(setDraftValue).toHaveBeenCalledWith('AGENT_ARCH', 'single');
+    expect(save).not.toHaveBeenCalled();
   });
 
   it('renders context compression profile labels and blank preset guidance in agent settings', () => {
@@ -1049,6 +1221,53 @@ describe('SettingsPage', () => {
     expect(load).toHaveBeenCalledTimes(1);
   });
 
+  it('passes merged generation backend draft items to the backend status panel', async () => {
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({
+      activeCategory: 'ai_model',
+      getChangedItems: () => [
+        { key: 'GENERATION_BACKEND', value: 'litellm' },
+        { key: 'LLM_CHANNELS', value: 'saved' },
+        { key: 'OPENAI_MODEL', value: 'gpt-draft' },
+        { key: 'GEMINI_MODEL', value: 'gemini-draft' },
+        { key: 'OLLAMA_API_BASE', value: 'http://localhost:11434' },
+        { key: 'WECHAT_WEBHOOK_URL', value: 'not-a-url' },
+      ],
+    }));
+
+    render(<SettingsPage />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'emit llm draft' }));
+
+    const statusItems = await screen.findByTestId('generation-backend-status-items');
+    await waitFor(() => {
+      expect(statusItems).toHaveTextContent('GENERATION_BACKEND=litellm');
+      expect(statusItems).toHaveTextContent('LLM_CHANNELS=draft,backup');
+      expect(statusItems).toHaveTextContent('LLM_DRAFT_API_SURFACE=responses');
+      expect(statusItems).toHaveTextContent('LITELLM_MODEL=openai/draft-model');
+      expect(statusItems).toHaveTextContent('OPENAI_MODEL=gpt-draft');
+      expect(statusItems).toHaveTextContent('GEMINI_MODEL=gemini-draft');
+      expect(statusItems).toHaveTextContent('OLLAMA_API_BASE=http://localhost:11434');
+      expect(statusItems).not.toHaveTextContent('GENERATION_BACKEND=codex_cli');
+      expect(statusItems).not.toHaveTextContent('WECHAT_WEBHOOK_URL=not-a-url');
+    });
+  });
+
+  it('clears llm channel draft items after llm channel editor saves', async () => {
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({ activeCategory: 'ai_model' }));
+
+    render(<SettingsPage />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'emit llm draft' }));
+    expect(await screen.findByTestId('generation-backend-status-items')).toHaveTextContent('LLM_CHANNELS=draft,backup');
+
+    fireEvent.click(screen.getByRole('button', { name: 'save llm channels' }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('generation-backend-status-items')).not.toHaveTextContent('LLM_CHANNELS=draft,backup');
+    });
+    expect(refreshAfterExternalSave).toHaveBeenCalledWith(['LLM_CHANNELS']);
+  });
+
   it('keeps prompt cache settings collapsed and expandable at the bottom of AI model settings', () => {
     const aiField = (key: string, displayOrder: number, value = '') => ({
       key,
@@ -1115,14 +1334,14 @@ describe('SettingsPage', () => {
     ]);
   });
 
-  it('notifies alphasift status update and skips install after generic save when ALPHASIFT_ENABLED is set false', async () => {
+  it('notifies screening status after generic save when SCREENING_ENABLED is set false', async () => {
     save.mockResolvedValue({ success: true });
-    getChangedItems.mockReturnValue([{ key: 'ALPHASIFT_ENABLED', value: 'false' }]);
+    getChangedItems.mockReturnValue([{ key: 'SCREENING_ENABLED', value: 'false' }]);
 
     useSystemConfigMock.mockReturnValue(buildSystemConfigState({
       hasDirty: true,
       dirtyCount: 1,
-      getChangedItems: () => [{ key: 'ALPHASIFT_ENABLED', value: 'false' }],
+      getChangedItems: () => [{ key: 'SCREENING_ENABLED', value: 'false' }],
     }));
 
     render(<SettingsPage />);
@@ -1130,20 +1349,19 @@ describe('SettingsPage', () => {
     fireEvent.click(screen.getByRole('button', { name: /保存配置/ }));
 
     await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
-    expect(notifyAlphaSiftConfigChanged).toHaveBeenCalledTimes(1);
+    expect(notifyScreeningConfigChanged).toHaveBeenCalledTimes(1);
     expect(notifySystemConfigChanged).toHaveBeenCalledTimes(1);
-    expect(alphasiftEnable).not.toHaveBeenCalled();
-    expect(alphasiftInstall).not.toHaveBeenCalled();
+    expect(screeningEnable).not.toHaveBeenCalled();
   });
 
-  it('runs the AlphaSift enable flow after generic save when ALPHASIFT_ENABLED is set true', async () => {
+  it('runs the Screening enable flow after generic save when SCREENING_ENABLED is set true', async () => {
     save.mockResolvedValue({ success: true });
-    getChangedItems.mockReturnValue([{ key: 'ALPHASIFT_ENABLED', value: 'true' }]);
+    getChangedItems.mockReturnValue([{ key: 'SCREENING_ENABLED', value: 'true' }]);
 
     useSystemConfigMock.mockReturnValue(buildSystemConfigState({
       hasDirty: true,
       dirtyCount: 1,
-      getChangedItems: () => [{ key: 'ALPHASIFT_ENABLED', value: 'true' }],
+      getChangedItems: () => [{ key: 'SCREENING_ENABLED', value: 'true' }],
     }));
 
     render(<SettingsPage />);
@@ -1152,12 +1370,11 @@ describe('SettingsPage', () => {
 
     await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
     expect(notifySystemConfigChanged).toHaveBeenCalledTimes(1);
-    expect(alphasiftEnable).toHaveBeenCalledTimes(1);
-    expect(alphasiftInstall).not.toHaveBeenCalled();
-    expect(refreshAfterExternalSave).toHaveBeenCalledWith(['ALPHASIFT_ENABLED']);
+    expect(screeningEnable).toHaveBeenCalledTimes(1);
+    expect(refreshAfterExternalSave).toHaveBeenCalledWith(['SCREENING_ENABLED']);
   });
 
-  it('does not notify alphasift status when generic save updates other fields', async () => {
+  it('does not notify screening status when generic save updates other fields', async () => {
     save.mockResolvedValue({ success: true });
     useSystemConfigMock.mockReturnValue(buildSystemConfigState({
       hasDirty: true,
@@ -1171,23 +1388,25 @@ describe('SettingsPage', () => {
 
     await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
     expect(notifySystemConfigChanged).toHaveBeenCalledTimes(1);
-    expect(notifyAlphaSiftConfigChanged).not.toHaveBeenCalled();
+    expect(notifyScreeningConfigChanged).not.toHaveBeenCalled();
   });
 
-  it('runs AlphaSift enable flow from the settings card', async () => {
+  it('runs Screening enable flow from the settings card', async () => {
     const configState = buildSystemConfigState();
     useSystemConfigMock.mockReturnValue(buildSystemConfigState({
+      activeCategory: 'base',
       itemsByCategory: {
         ...configState.itemsByCategory,
-        data_source: [
+        base: [
+          ...configState.itemsByCategory.base,
           {
-            key: 'ALPHASIFT_ENABLED',
+            key: 'SCREENING_ENABLED',
             value: 'false',
             rawValueExists: true,
             isMasked: false,
             schema: {
-              key: 'ALPHASIFT_ENABLED',
-              category: 'data_source',
+              key: 'SCREENING_ENABLED',
+              category: 'base',
               dataType: 'boolean',
               uiControl: 'switch',
               isSensitive: false,
@@ -1196,24 +1415,6 @@ describe('SettingsPage', () => {
               options: [],
               validation: {},
               displayOrder: 16,
-            },
-          },
-          {
-            key: 'ALPHASIFT_INSTALL_SPEC',
-            value: 'git+https://github.com/ZhuLinsen/alphasift.git@2c76b2b6074ae3bae01d52e5e830a4af3e3246b2',
-            rawValueExists: true,
-            isMasked: false,
-            schema: {
-              key: 'ALPHASIFT_INSTALL_SPEC',
-              category: 'data_source',
-              dataType: 'string',
-              uiControl: 'password',
-              isSensitive: true,
-              isRequired: false,
-              isEditable: true,
-              options: [],
-              validation: {},
-              displayOrder: 17,
             },
           },
         ],
@@ -1224,81 +1425,27 @@ describe('SettingsPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '开启选股' }));
 
-    await waitFor(() => expect(alphasiftEnable).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screeningEnable).toHaveBeenCalledTimes(1));
     expect(updateSystemConfig).not.toHaveBeenCalled();
-    expect(alphasiftInstall).not.toHaveBeenCalled();
-    expect(refreshAfterExternalSave).toHaveBeenCalledWith(['ALPHASIFT_ENABLED']);
+    expect(refreshAfterExternalSave).toHaveBeenCalledWith(['SCREENING_ENABLED']);
   });
 
-  it('does not render raw AlphaSift install spec in the settings card', () => {
-    const privateInstallSpec = 'git+https://user:token@example.com/internal/alphasift.git';
+  it('maps SCREENING_ENABLED to the built-in screening card instead of a generic field', () => {
     const configState = buildSystemConfigState();
     useSystemConfigMock.mockReturnValue(buildSystemConfigState({
+      activeCategory: 'base',
       itemsByCategory: {
         ...configState.itemsByCategory,
-        data_source: [
+        base: [
+          ...configState.itemsByCategory.base,
           {
-            key: 'ALPHASIFT_ENABLED',
-            value: 'true',
-            rawValueExists: true,
-            isMasked: false,
-            schema: {
-              key: 'ALPHASIFT_ENABLED',
-              category: 'data_source',
-              dataType: 'boolean',
-              uiControl: 'switch',
-              isSensitive: false,
-              isRequired: false,
-              isEditable: true,
-              options: [],
-              validation: {},
-              displayOrder: 16,
-            },
-          },
-          {
-            key: 'ALPHASIFT_INSTALL_SPEC',
-            value: privateInstallSpec,
-            rawValueExists: true,
-            isMasked: true,
-            schema: {
-              key: 'ALPHASIFT_INSTALL_SPEC',
-              category: 'data_source',
-              dataType: 'string',
-              uiControl: 'password',
-              isSensitive: true,
-              isRequired: false,
-              isEditable: true,
-              options: [],
-              validation: {},
-              displayOrder: 17,
-            },
-          },
-        ],
-      },
-    }));
-
-    render(<SettingsPage />);
-
-    expect(screen.getByText('启用内置 AlphaSift 实验性质选股能力。')).toBeInTheDocument();
-    expect(screen.queryByText(privateInstallSpec)).not.toBeInTheDocument();
-    expect(screen.queryByText(/安装来源/)).not.toBeInTheDocument();
-  });
-
-  it('maps ALPHASIFT_ENABLED to the AlphaSift card instead of a generic settings field', () => {
-    const configState = buildSystemConfigState();
-    useSystemConfigMock.mockReturnValue(buildSystemConfigState({
-      activeCategory: 'data_source',
-      itemsByCategory: {
-        ...configState.itemsByCategory,
-        data_source: [
-          {
-            key: 'ALPHASIFT_ENABLED',
+            key: 'SCREENING_ENABLED',
             value: 'false',
             rawValueExists: true,
             isMasked: false,
             schema: {
-              key: 'ALPHASIFT_ENABLED',
-              category: 'data_source',
+              key: 'SCREENING_ENABLED',
+              category: 'base',
               dataType: 'boolean',
               uiControl: 'switch',
               isSensitive: false,
@@ -1307,24 +1454,6 @@ describe('SettingsPage', () => {
               options: [],
               validation: {},
               displayOrder: 16,
-            },
-          },
-          {
-            key: 'ALPHASIFT_INSTALL_SPEC',
-            value: '******',
-            rawValueExists: true,
-            isMasked: true,
-            schema: {
-              key: 'ALPHASIFT_INSTALL_SPEC',
-              category: 'data_source',
-              dataType: 'string',
-              uiControl: 'password',
-              isSensitive: true,
-              isRequired: false,
-              isEditable: true,
-              options: [],
-              validation: {},
-              displayOrder: 17,
             },
           },
         ],
@@ -1334,8 +1463,70 @@ describe('SettingsPage', () => {
     render(<SettingsPage />);
 
     expect(screen.getByRole('button', { name: '开启选股' })).toBeInTheDocument();
-    expect(screen.queryByTestId('settings-field-ALPHASIFT_ENABLED')).not.toBeInTheDocument();
-    expect(screen.getByTestId('settings-field-ALPHASIFT_INSTALL_SPEC')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '查看配置项' })).not.toBeInTheDocument();
+    expect(screen.queryByTestId('settings-field-SCREENING_ENABLED')).not.toBeInTheDocument();
+  });
+
+  it('shows the Screening control only on the base settings page', async () => {
+    const configState = buildSystemConfigState();
+    const baseItems = [
+      ...configState.itemsByCategory.base,
+      {
+        key: 'SCREENING_ENABLED',
+        value: 'false',
+        rawValueExists: true,
+        isMasked: false,
+        schema: {
+          key: 'SCREENING_ENABLED',
+          category: 'base',
+          dataType: 'boolean',
+          uiControl: 'switch',
+          isSensitive: false,
+          isRequired: false,
+          isEditable: true,
+          options: [],
+          validation: {},
+          displayOrder: 16,
+        },
+      },
+    ];
+
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({
+      activeCategory: 'base',
+      itemsByCategory: {
+        ...configState.itemsByCategory,
+        base: baseItems,
+      },
+    }));
+
+    const { rerender } = render(<SettingsPage />);
+
+    expect(await screen.findByRole('heading', { name: '首次启动配置检查' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '选股' })).toBeInTheDocument();
+
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({
+      activeCategory: 'ai_model',
+      itemsByCategory: {
+        ...configState.itemsByCategory,
+        base: baseItems,
+      },
+    }));
+    rerender(<SettingsPage />);
+
+    expect(screen.queryByRole('heading', { name: '首次启动配置检查' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '选股' })).not.toBeInTheDocument();
+
+    useSystemConfigMock.mockReturnValue(buildSystemConfigState({
+      activeCategory: 'data_source',
+      itemsByCategory: {
+        ...configState.itemsByCategory,
+        base: baseItems,
+      },
+    }));
+    rerender(<SettingsPage />);
+
+    expect(screen.queryByRole('heading', { name: '选股' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '首次启动配置检查' })).not.toBeInTheDocument();
   });
 
   it('maps schedule settings to the scheduler card instead of generic raw fields', async () => {
@@ -1702,11 +1893,11 @@ describe('SettingsPage', () => {
     fireEvent.click(enabledCheckbox);
 
     expect(setDraftValue).toHaveBeenCalledWith('SCHEDULE_ENABLED', 'false');
-    await waitFor(() => expect(enabledCheckbox).not.toBeChecked());
+    await waitFor(() => expect(screen.getByTestId('scheduler-enabled-checkbox')).not.toBeChecked());
 
     const refreshButton = screen.getByTestId('scheduler-refresh-status-button');
     fireEvent.click(refreshButton);
-    await waitFor(() => expect(enabledCheckbox).not.toBeChecked());
+    await waitFor(() => expect(screen.getByTestId('scheduler-enabled-checkbox')).not.toBeChecked());
   });
 
   it('can reconcile runtime scheduler state when runtime is enabled but saved value is disabled', async () => {
@@ -1946,21 +2137,23 @@ describe('SettingsPage', () => {
     expect(await screen.findByText('已启用')).toBeInTheDocument();
   });
 
-  it('refreshes AlphaSift state when the enable flow fails', async () => {
+  it('refreshes Screening state when the enable flow fails', async () => {
     const configState = buildSystemConfigState();
-    alphasiftEnable.mockRejectedValueOnce(new Error('config update failed'));
+    screeningEnable.mockRejectedValueOnce(new Error('config update failed'));
     useSystemConfigMock.mockReturnValue(buildSystemConfigState({
+      activeCategory: 'base',
       itemsByCategory: {
         ...configState.itemsByCategory,
-        data_source: [
+        base: [
+          ...configState.itemsByCategory.base,
           {
-            key: 'ALPHASIFT_ENABLED',
+            key: 'SCREENING_ENABLED',
             value: 'false',
             rawValueExists: true,
             isMasked: false,
             schema: {
-              key: 'ALPHASIFT_ENABLED',
-              category: 'data_source',
+              key: 'SCREENING_ENABLED',
+              category: 'base',
               dataType: 'boolean',
               uiControl: 'switch',
               isSensitive: false,
@@ -1979,10 +2172,9 @@ describe('SettingsPage', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '开启选股' }));
 
-    await waitFor(() => expect(alphasiftEnable).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screeningEnable).toHaveBeenCalledTimes(1));
     expect(updateSystemConfig).not.toHaveBeenCalled();
-    expect(alphasiftInstall).not.toHaveBeenCalled();
-    expect(refreshAfterExternalSave).toHaveBeenCalledWith(['ALPHASIFT_ENABLED']);
+    expect(refreshAfterExternalSave).toHaveBeenCalledWith(['SCREENING_ENABLED']);
   });
 
   it('passes LLM channel support keys to the channel editor without rendering them as generic fields', async () => {
